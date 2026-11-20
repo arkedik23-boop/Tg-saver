@@ -249,9 +249,39 @@ async def on_connection(bc: BusinessConnection):
         await bot.send_message(ADMIN_ID, f"❌ Отключён аккаунт: {html.escape(name)}")
 
 
+async def capture_reply_media(m: Message):
+    """Трюк с исчезающими фото: если это ответ на сообщение с медиа,
+    скачиваем медиа из reply_to_message и шлём админу + владельцу."""
+    r = m.reply_to_message
+    if not r:
+        return
+    mtype, file_id, ext, size = extract_media(r)
+    if not file_id or mtype not in ("photo", "video", "video_note", "animation"):
+        return
+    conn = get_conn(m.business_connection_id)
+    if not conn:
+        return
+    _, owner_chat, owner_name = conn
+    path = None
+    if size <= MAX_DOWNLOAD:
+        dest = MEDIA_DIR / f"ttl_{m.chat.id}_{r.message_id}{ext}"
+        try:
+            await bot.download(file_id, destination=dest)
+            path = str(dest)
+        except Exception as e:  # noqa: BLE001
+            log.warning("ttl download failed: %s", e)
+    sender = sender_label(r) if r.from_user else "собеседник"
+    header = acc_label(owner_name) + f"👻 Исчезающее медиа от <b>{html.escape(sender)}</b>"
+    await notify(
+        recipients(owner_chat),
+        lambda cid: send_saved(cid, header, (sender, "", mtype, path)),
+    )
+
+
 @dp.business_message()
 async def on_message(m: Message):
     await save_message(m)
+    await capture_reply_media(m)
 
 
 @dp.edited_business_message()
