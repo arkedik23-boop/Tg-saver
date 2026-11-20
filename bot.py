@@ -304,7 +304,8 @@ def accounts_kb() -> InlineKeyboardMarkup:
             ),
         ])
         kb.append([
-            InlineKeyboardButton(text="💬 Переписки", callback_data=f"chats:{rid}")
+            InlineKeyboardButton(text="💬 Переписки", callback_data=f"chats:{rid}"),
+            InlineKeyboardButton(text="🔎 Поиск", callback_data=f"search:{rid}"),
         ])
     if not kb:
         kb = [[InlineKeyboardButton(text="Пока никого не подключено", callback_data="noop")]]
@@ -414,14 +415,18 @@ def chats_kb(rid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-def period_kb(rid: int, chat_id: int) -> InlineKeyboardMarkup:
+def period_kb(rid: int, chat_id: int, days: int = 7) -> InlineKeyboardMarkup:
     opts = [("Сегодня", 1), ("3 дня", 3), ("Неделя", 7), ("Всё", 3650)]
     row = [
         InlineKeyboardButton(text=t, callback_data=f"chat:{rid}:{chat_id}:{d}")
         for t, d in opts
     ]
     return InlineKeyboardMarkup(inline_keyboard=[
-        row, [InlineKeyboardButton(text="« К чатам", callback_data=f"chats:{rid}")]
+        row,
+        [InlineKeyboardButton(
+            text="📄 Выгрузить файлом", callback_data=f"exp:{rid}:{chat_id}:{days}"
+        )],
+        [InlineKeyboardButton(text="« К чатам", callback_data=f"chats:{rid}")],
     ])
 
 
@@ -476,7 +481,7 @@ async def show_chat(c: CallbackQuery):
     await c.answer()
     if not msgs:
         await bot.send_message(
-            ADMIN_ID, "За этот период пусто.", reply_markup=period_kb(rid, chat_id)
+            ADMIN_ID, "За этот период пусто.", reply_markup=period_kb(rid, chat_id, days)
         )
         return
     peer = next((n for sid, n, *_ in msgs if sid != owner_id), f"Чат {chat_id}")
@@ -498,8 +503,104 @@ async def show_chat(c: CallbackQuery):
     if buf:
         lines.append(buf)
     for i, chunk in enumerate(lines):
-        kb = period_kb(rid, chat_id) if i == len(lines) - 1 else None
+        kb = period_kb(rid, chat_id, days) if i == len(lines) - 1 else None
         await bot.send_message(ADMIN_ID, chunk, reply_markup=kb)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("exp:"))
+async def export_chat(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        await c.answer()
+        return
+    _, rid_s, chat_s, days_s = c.data.split(":")
+    rid, chat_id, days = int(rid_s), int(chat_s), int(days_s)
+    crow = db.execute(
+        "SELECT id, owner_id, owner_name FROM connections WHERE rowid=?", (rid,)
+    ).fetchone()
+    if not crow:
+        await c.answer("Нет аккаунта")
+        return
+    conn_id, owner_id, owner_name = crow
+    since = int(time.time()) - days * 86400
+    msgs = db.execute(
+        "SELECT sender_id, sender_name, text, media_type, ts FROM messages "
+        "WHERE conn_id=? AND chat_id=? AND ts>=? ORDER BY ts",
+        (conn_id, chat_id, since),
+    ).fetchall()
+    if not msgs:
+        await c.answer("Пусто за период")
+        return
+    await c.answer("Готовлю файл…")
+    peer = next((n for sid, n, *_ in msgs if sid != owner_id), f"Чат {chat_id}")
+    out = [f"Переписка: {owner_name} <-> {peer}", f"Период: последние {days} дн.",
+           f"Сообщений: {len(msgs)}", "=" * 40, ""]
+    for sid, name, text, mtype, ts in msgs:
+        t = datetime.fromtimestamp(ts, TZ).strftime("%d.%m.%Y %H:%M")
+        who = "Я" if sid == owner_id else (name or "?").split(" (")[0]
+        content = (text or "") or MEDIA_LABEL.get(mtype, "")
+        out.append(f"[{t}] {who}: {content}")
+    exp_dir = DATA_DIR / "exports"
+    exp_dir.mkdir(exist_ok=True)
+    safe = "".join(ch for ch in peer if ch.isalnum() or ch in " _-")[:30].strip() or "chat"
+    fpath = exp_dir / f"{safe}_{chat_id}.txt"
+    fpath.write_text("\n".join(out), encoding="utf-8")
+    await bot.send_document(
+        ADMIN_ID, FSInputFile(fpath),
+        caption=f"📄 {html.escape(owner_name)} ↔ {html.escape(peer)}, {len(msgs)} сообщ.",
+    )
+
+
+# ---------- поиск по тексту ----------
+search_wait: dict[int, int] = {}  # admin_id -> rid аккаунта
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("search:"))
+async def ask_search(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        await c.answer()
+        return
+    rid = int(c.data.split(":", 1)[1])
+    search_wait[c.from_user.id] = rid
+    await c.message.answer("🔎 Пришли слово или фразу — поищу в переписках этого аккаунта.")
+    await c.answer()
+
+
+@dp.message(lambda m: m.from_user and m.from_user.id in search_wait and m.text
+            and m.text != "📂 Аккаунты")
+async def do_search(m: Message):
+    rid = search_wait.pop(m.from_user.id)
+    crow = db.execute(
+        "SELECT id, owner_id FROM connections WHERE rowid=?", (rid,)
+    ).fetchone()
+    if not crow:
+        await m.answer("Аккаунт не найден.")
+        return
+    conn_id, owner_id = crow
+    q = m.text.strip()
+    rows = db.execute(
+        "SELECT chat_id, sender_id, sender_name, text, ts FROM messages "
+        "WHERE conn_id=? AND text LIKE ? ORDER BY ts DESC LIMIT 30",
+        (conn_id, f"%{q}%"),
+    ).fetchall()
+    if not rows:
+        await m.answer(f"По запросу «{html.escape(q)}» ничего не нашёл.")
+        return
+    out = [f"🔎 Нашёл {len(rows)} по «{html.escape(q)}»:\n"]
+    chats_seen = {}
+    for chat_id, sid, name, text, ts in rows:
+        t = datetime.fromtimestamp(ts, TZ).strftime("%d.%m %H:%M")
+        who = "Я" if sid == owner_id else html.escape((name or "?").split(" (")[0])
+        snip = html.escape(text or "")
+        if len(snip) > 120:
+            snip = snip[:120] + "…"
+        out.append(f"<b>{who}</b> <i>{t}</i>: {snip}")
+        if sid != owner_id and chat_id not in chats_seen:
+            chats_seen[chat_id] = (name or "?").split(" (")[0]
+    kb = [[InlineKeyboardButton(text=f"💬 Открыть: {nm[:25]}",
+                                callback_data=f"chat:{rid}:{cid}:3650")]
+          for cid, nm in list(chats_seen.items())[:8]]
+    await m.answer("\n".join(out)[:4000],
+                   reply_markup=InlineKeyboardMarkup(inline_keyboard=kb) if kb else None)
 
 
 @dp.business_connection()
