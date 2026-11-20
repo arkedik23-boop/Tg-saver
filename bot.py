@@ -24,7 +24,9 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -239,6 +241,13 @@ def welcome_kb() -> InlineKeyboardMarkup:
     )
 
 
+def admin_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📂 Аккаунты")]],
+        resize_keyboard=True,
+    )
+
+
 @dp.message(Command("start"))
 async def start(m: Message):
     # приветствие с баннером и инструкцией — всем
@@ -254,7 +263,8 @@ async def start(m: Message):
     if m.from_user.id == ADMIN_ID:
         await m.answer(
             "Ты админ. Всё от всех подключённых аккаунтов прилетает сюда.\n"
-            "/accounts — список подключённых."
+            "Жми кнопку «📂 Аккаунты» внизу, чтобы управлять заглушкой и смотреть накопленное.",
+            reply_markup=admin_menu(),
         )
 
 
@@ -295,7 +305,7 @@ def accounts_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-@dp.message(Command("accounts"))
+@dp.message(lambda m: m.text == "📂 Аккаунты")
 async def accounts(m: Message):
     if m.from_user.id != ADMIN_ID:
         return
