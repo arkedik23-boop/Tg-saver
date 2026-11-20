@@ -63,7 +63,8 @@ db.executescript(
         id TEXT PRIMARY KEY,
         owner_id INTEGER NOT NULL,
         owner_chat_id INTEGER NOT NULL,
-        owner_name TEXT NOT NULL DEFAULT ''
+        owner_name TEXT NOT NULL DEFAULT '',
+        muted INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS messages(
         conn_id TEXT, chat_id INTEGER, msg_id INTEGER,
@@ -71,8 +72,18 @@ db.executescript(
         text TEXT, media_type TEXT, file_path TEXT, ts INTEGER,
         PRIMARY KEY(conn_id, chat_id, msg_id)
     );
+    CREATE TABLE IF NOT EXISTS events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conn_id TEXT, owner_name TEXT,
+        header TEXT, text TEXT, media_type TEXT, file_path TEXT,
+        ts INTEGER, seen INTEGER NOT NULL DEFAULT 0
+    );
     """
 )
+# миграция: добавить muted, если база из старой версии
+cols = [r[1] for r in db.execute("PRAGMA table_info(connections)").fetchall()]
+if "muted" not in cols:
+    db.execute("ALTER TABLE connections ADD COLUMN muted INTEGER NOT NULL DEFAULT 0")
 db.commit()
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -144,9 +155,10 @@ async def save_message(m: Message, owner_id: int | None = None):
 
 
 async def send_saved(owner_chat_id: int, header: str, row):
-    """row = (sender_name, text, media_type, file_path)"""
+    """row = (sender_name, text, media_type, file_path).
+    text уже готов к выводу (экранирование делает вызывающий код)."""
     _, text, mtype, path = row
-    body = f"\n\n{html.escape(text)}" if text else ""
+    body = f"\n\n{text}" if text else ""
     caption = (header + body)[:1024]
     if path and Path(path).exists():
         f = FSInputFile(path)
@@ -184,6 +196,39 @@ async def notify(chat_ids: list[int], coro_factory):
 
 def acc_label(name: str) -> str:
     return f"👤 <b>Аккаунт:</b> {html.escape(name)}\n"
+
+
+async def emit_event(conn_id: str, header: str, text: str, mtype, path):
+    """Пишет событие в журнал, шлёт владельцу всегда, админу — если не заглушён.
+    header и text уже экранированы вызывающим кодом."""
+    row = db.execute(
+        "SELECT owner_chat_id, owner_name, muted FROM connections WHERE id=?",
+        (conn_id,),
+    ).fetchone()
+    if not row:
+        return
+    owner_chat, owner_name, muted = row
+    cur = db.execute(
+        "INSERT INTO events(conn_id,owner_name,header,text,media_type,file_path,ts,seen)"
+        " VALUES(?,?,?,?,?,?,?,0)",
+        (conn_id, owner_name, header, text, mtype, path, int(time.time())),
+    )
+    db.commit()
+    eid = cur.lastrowid
+    # владельцу (его чат с ботом) — всегда
+    if owner_chat != ADMIN_ID:
+        try:
+            await send_saved(owner_chat, header, (owner_name, text, mtype, path))
+        except Exception as e:  # noqa: BLE001
+            log.warning("owner deliver fail %s: %s", owner_chat, e)
+    # админу — только если аккаунт не заглушён
+    if not muted:
+        try:
+            await send_saved(ADMIN_ID, header, (owner_name, text, mtype, path))
+            db.execute("UPDATE events SET seen=1 WHERE id=?", (eid,))
+            db.commit()
+        except Exception as e:  # noqa: BLE001
+            log.warning("admin deliver fail: %s", e)
 
 
 def welcome_kb() -> InlineKeyboardMarkup:
@@ -225,12 +270,97 @@ async def demo(c: CallbackQuery):
     await c.answer()
 
 
+def accounts_kb() -> InlineKeyboardMarkup:
+    rows = db.execute(
+        "SELECT rowid, id, owner_name, muted FROM connections ORDER BY rowid"
+    ).fetchall()
+    kb = []
+    for rid, conn_id, name, muted in rows:
+        unseen = db.execute(
+            "SELECT COUNT(*) FROM events WHERE conn_id=? AND seen=0", (conn_id,)
+        ).fetchone()[0]
+        mark = "🔕" if muted else "🔔"
+        kb.append([InlineKeyboardButton(text=f"{mark} {name[:28]}", callback_data="noop")])
+        kb.append([
+            InlineKeyboardButton(
+                text=("🔔 Включить" if muted else "🔕 Заглушить"),
+                callback_data=f"mute:{rid}",
+            ),
+            InlineKeyboardButton(
+                text=f"📂 Показать ({unseen})", callback_data=f"show:{rid}"
+            ),
+        ])
+    if not kb:
+        kb = [[InlineKeyboardButton(text="Пока никого не подключено", callback_data="noop")]]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
 @dp.message(Command("accounts"))
 async def accounts(m: Message):
     if m.from_user.id != ADMIN_ID:
         return
-    rows = db.execute("SELECT owner_name FROM connections").fetchall()
-    await m.answer("\n".join(f"• {html.escape(r[0])}" for r in rows) or "Пока никого.")
+    await m.answer(
+        "Подключённые аккаунты. 🔕 — заглушён (не пингует, но всё копится).\n"
+        "«Показать» вываливает накопленное и помечает прочитанным.",
+        reply_markup=accounts_kb(),
+    )
+
+
+@dp.callback_query(lambda c: c.data == "noop")
+async def noop(c: CallbackQuery):
+    await c.answer()
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("mute:"))
+async def toggle_mute(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        await c.answer()
+        return
+    rid = int(c.data.split(":", 1)[1])
+    db.execute("UPDATE connections SET muted=1-muted WHERE rowid=?", (rid,))
+    db.commit()
+    muted = db.execute("SELECT muted FROM connections WHERE rowid=?", (rid,)).fetchone()
+    try:
+        await c.message.edit_reply_markup(reply_markup=accounts_kb())
+    except Exception:  # noqa: BLE001
+        pass
+    await c.answer("Заглушён" if muted and muted[0] else "Уведомления включены")
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("show:"))
+async def show_saved(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        await c.answer()
+        return
+    rid = int(c.data.split(":", 1)[1])
+    crow = db.execute(
+        "SELECT id, owner_name FROM connections WHERE rowid=?", (rid,)
+    ).fetchone()
+    if not crow:
+        await c.answer("Нет такого аккаунта")
+        return
+    conn_id, owner_name = crow
+    evs = db.execute(
+        "SELECT id, header, text, media_type, file_path FROM events "
+        "WHERE conn_id=? AND seen=0 ORDER BY ts",
+        (conn_id,),
+    ).fetchall()
+    if not evs:
+        await c.answer("Накопленного нет")
+        return
+    await c.answer(f"Показываю {len(evs)}…")
+    await bot.send_message(ADMIN_ID, f"📂 Накопленное: <b>{html.escape(owner_name)}</b>")
+    for eid, header, text, mtype, path in evs:
+        try:
+            await send_saved(ADMIN_ID, header, (owner_name, text, mtype, path))
+        except Exception as e:  # noqa: BLE001
+            log.warning("dump deliver fail: %s", e)
+        db.execute("UPDATE events SET seen=1 WHERE id=?", (eid,))
+    db.commit()
+    try:
+        await c.message.edit_reply_markup(reply_markup=accounts_kb())
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @dp.business_connection()
@@ -238,7 +368,9 @@ async def on_connection(bc: BusinessConnection):
     name = bc.user.full_name + (f" (@{bc.user.username})" if bc.user.username else "")
     if bc.is_enabled:
         db.execute(
-            "INSERT OR REPLACE INTO connections VALUES (?,?,?,?)",
+            "INSERT INTO connections(id,owner_id,owner_chat_id,owner_name) VALUES(?,?,?,?)"
+            " ON CONFLICT(id) DO UPDATE SET owner_id=excluded.owner_id,"
+            " owner_chat_id=excluded.owner_chat_id, owner_name=excluded.owner_name",
             (bc.id, bc.user.id, bc.user_chat_id, name),
         )
         db.commit()
@@ -264,7 +396,7 @@ async def capture_reply_media(m: Message):
     conn = get_conn(m.business_connection_id)
     if not conn:
         return
-    _, owner_chat, owner_name = conn
+    _, _, owner_name = conn
     path = None
     if size <= MAX_DOWNLOAD:
         dest = MEDIA_DIR / f"ttl_{m.chat.id}_{r.message_id}{ext}"
@@ -275,10 +407,7 @@ async def capture_reply_media(m: Message):
             log.warning("ttl download failed: %s", e)
     sender = sender_label(r) if r.from_user else "собеседник"
     header = acc_label(owner_name) + f"👻 Исчезающее медиа от <b>{html.escape(sender)}</b>"
-    await notify(
-        recipients(owner_chat),
-        lambda cid: send_saved(cid, header, (sender, "", mtype, path)),
-    )
+    await emit_event(m.business_connection_id, header, "", mtype, path)
 
 
 @dp.business_message()
@@ -299,13 +428,15 @@ async def on_edit(m: Message):
     ).fetchone()
     new_text = m.text or m.caption or ""
     if m.from_user and m.from_user.id != owner_id and old and old[0] != new_text:
-        msg_text = (
+        header = (
             acc_label(owner_name)
-            + f"✏️ <b>{html.escape(sender_label(m))}</b> изменил(а) сообщение\n\n"
+            + f"✏️ <b>{html.escape(sender_label(m))}</b> изменил(а) сообщение"
+        )
+        body = (
             f"<b>Было:</b>\n{html.escape(old[0] or '—')}\n\n"
             f"<b>Стало:</b>\n{html.escape(new_text or '—')}"
         )
-        await notify(recipients(owner_chat), lambda cid: bot.send_message(cid, msg_text))
+        await emit_event(m.business_connection_id, header, body, None, None)
     db.execute(
         "UPDATE messages SET text=? WHERE conn_id=? AND chat_id=? AND msg_id=?",
         (new_text, m.business_connection_id, m.chat.id, m.message_id),
@@ -331,9 +462,8 @@ async def on_deleted(ev: BusinessMessagesDeleted):
         if sender_id == owner_id:  # свои удаления не трогаем
             continue
         header = acc_label(owner_name) + f"🗑 <b>{html.escape(name)}</b> удалил(а) сообщение"
-        await notify(
-            recipients(owner_chat),
-            lambda cid: send_saved(cid, header, (name, text, mtype, path)),
+        await emit_event(
+            ev.business_connection_id, header, html.escape(text or ""), mtype, path
         )
 
 
@@ -346,12 +476,24 @@ async def cleanup_loop():
             (cutoff,),
         ).fetchall()
         for conn_id, chat_id, msg_id, fp in rows:
-            if fp:
+            if fp and not db.execute(
+                "SELECT 1 FROM events WHERE file_path=? LIMIT 1", (fp,)
+            ).fetchone():
                 Path(fp).unlink(missing_ok=True)
             db.execute(
                 "DELETE FROM messages WHERE conn_id=? AND chat_id=? AND msg_id=?",
                 (conn_id, chat_id, msg_id),
             )
+        # прочитанные события старше срока
+        erows = db.execute(
+            "SELECT id, file_path FROM events WHERE seen=1 AND ts<?", (cutoff,)
+        ).fetchall()
+        for eid, fp in erows:
+            if fp and not db.execute(
+                "SELECT 1 FROM messages WHERE file_path=? LIMIT 1", (fp,)
+            ).fetchone():
+                Path(fp).unlink(missing_ok=True)
+            db.execute("DELETE FROM events WHERE id=?", (eid,))
         db.commit()
         await asyncio.sleep(6 * 3600)
 
