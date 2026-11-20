@@ -11,7 +11,10 @@ import logging
 import os
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+TZ = timezone(timedelta(hours=4))  # Asia/Yerevan, под часовой пояс владельца
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -300,6 +303,9 @@ def accounts_kb() -> InlineKeyboardMarkup:
                 text=f"📂 Показать ({unseen})", callback_data=f"show:{rid}"
             ),
         ])
+        kb.append([
+            InlineKeyboardButton(text="💬 Переписки", callback_data=f"chats:{rid}")
+        ])
     if not kb:
         kb = [[InlineKeyboardButton(text="Пока никого не подключено", callback_data="noop")]]
     return InlineKeyboardMarkup(inline_keyboard=kb)
@@ -371,6 +377,129 @@ async def show_saved(c: CallbackQuery):
         await c.message.edit_reply_markup(reply_markup=accounts_kb())
     except Exception:  # noqa: BLE001
         pass
+
+
+MEDIA_LABEL = {
+    "photo": "[фото]", "video": "[видео]", "video_note": "[кружок]",
+    "voice": "[голосовое]", "audio": "[аудио]", "animation": "[гиф]",
+    "sticker": "[стикер]", "document": "[файл]",
+}
+
+
+def chats_kb(rid: int) -> InlineKeyboardMarkup:
+    """Список чатов аккаунта (по собеседникам) с числом сообщений."""
+    crow = db.execute("SELECT id, owner_id FROM connections WHERE rowid=?", (rid,)).fetchone()
+    kb = []
+    if crow:
+        conn_id, owner_id = crow
+        chats = db.execute(
+            "SELECT chat_id, COUNT(*) c, MAX(ts) t FROM messages WHERE conn_id=? "
+            "GROUP BY chat_id ORDER BY t DESC LIMIT 20",
+            (conn_id,),
+        ).fetchall()
+        for chat_id, cnt, _ in chats:
+            # имя собеседника = последний не-владелец в этом чате
+            peer = db.execute(
+                "SELECT sender_name FROM messages WHERE conn_id=? AND chat_id=? "
+                "AND sender_id!=? ORDER BY ts DESC LIMIT 1",
+                (conn_id, chat_id, owner_id),
+            ).fetchone()
+            title = (peer[0] if peer else f"Чат {chat_id}")[:30]
+            kb.append([InlineKeyboardButton(
+                text=f"💬 {title} ({cnt})", callback_data=f"chat:{rid}:{chat_id}:7"
+            )])
+    kb.append([InlineKeyboardButton(text="« Назад", callback_data="back")])
+    if len(kb) == 1:
+        kb.insert(0, [InlineKeyboardButton(text="Переписок пока нет", callback_data="noop")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def period_kb(rid: int, chat_id: int) -> InlineKeyboardMarkup:
+    opts = [("Сегодня", 1), ("3 дня", 3), ("Неделя", 7), ("Всё", 3650)]
+    row = [
+        InlineKeyboardButton(text=t, callback_data=f"chat:{rid}:{chat_id}:{d}")
+        for t, d in opts
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        row, [InlineKeyboardButton(text="« К чатам", callback_data=f"chats:{rid}")]
+    ])
+
+
+@dp.callback_query(lambda c: c.data == "back")
+async def back_to_accounts(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        await c.answer()
+        return
+    try:
+        await c.message.edit_text(
+            "Подключённые аккаунты. 🔕 — заглушён (не пингует, но всё копится).",
+            reply_markup=accounts_kb(),
+        )
+    except Exception:  # noqa: BLE001
+        await c.message.answer("Аккаунты:", reply_markup=accounts_kb())
+    await c.answer()
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("chats:"))
+async def show_chats(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        await c.answer()
+        return
+    rid = int(c.data.split(":", 1)[1])
+    try:
+        await c.message.edit_text("Выбери чат:", reply_markup=chats_kb(rid))
+    except Exception:  # noqa: BLE001
+        await c.message.answer("Выбери чат:", reply_markup=chats_kb(rid))
+    await c.answer()
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("chat:"))
+async def show_chat(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        await c.answer()
+        return
+    _, rid_s, chat_s, days_s = c.data.split(":")
+    rid, chat_id, days = int(rid_s), int(chat_s), int(days_s)
+    crow = db.execute(
+        "SELECT id, owner_id, owner_name FROM connections WHERE rowid=?", (rid,)
+    ).fetchone()
+    if not crow:
+        await c.answer("Нет аккаунта")
+        return
+    conn_id, owner_id, owner_name = crow
+    since = int(time.time()) - days * 86400
+    msgs = db.execute(
+        "SELECT sender_id, sender_name, text, media_type, ts FROM messages "
+        "WHERE conn_id=? AND chat_id=? AND ts>=? ORDER BY ts LIMIT 400",
+        (conn_id, chat_id, since),
+    ).fetchall()
+    await c.answer()
+    if not msgs:
+        await bot.send_message(
+            ADMIN_ID, "За этот период пусто.", reply_markup=period_kb(rid, chat_id)
+        )
+        return
+    peer = next((n for sid, n, *_ in msgs if sid != owner_id), f"Чат {chat_id}")
+    await bot.send_message(
+        ADMIN_ID,
+        f"💬 <b>{html.escape(owner_name)}</b> ↔ <b>{html.escape(peer)}</b> "
+        f"(за {days} дн., {len(msgs)} сообщ.)",
+    )
+    lines, buf = [], ""
+    for sid, name, text, mtype, ts in msgs:
+        t = datetime.fromtimestamp(ts, TZ).strftime("%d.%m %H:%M")
+        who = "Я" if sid == owner_id else html.escape((name or "?").split(" (")[0])
+        content = html.escape(text or "") or MEDIA_LABEL.get(mtype, "")
+        line = f"<b>{who}</b> <i>{t}</i>: {content}"
+        if len(buf) + len(line) > 3500:
+            lines.append(buf)
+            buf = ""
+        buf += line + "\n"
+    if buf:
+        lines.append(buf)
+    for i, chunk in enumerate(lines):
+        kb = period_kb(rid, chat_id) if i == len(lines) - 1 else None
+        await bot.send_message(ADMIN_ID, chunk, reply_markup=kb)
 
 
 @dp.business_connection()
