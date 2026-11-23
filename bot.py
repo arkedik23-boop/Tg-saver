@@ -211,8 +211,9 @@ def acc_label(name: str) -> str:
     return f"👤 <b>Аккаунт:</b> {html.escape(name)}\n"
 
 
-async def emit_event(conn_id: str, header: str, text: str, mtype, path):
+async def emit_event(conn_id: str, header: str, text: str, mtype, path, admin_only=False):
     """Пишет событие в журнал, шлёт владельцу всегда, админу — если не заглушён.
+    admin_only=True — владельцу НЕ шлём (чтоб менеджер не узнал о слежке).
     header и text уже экранированы вызывающим кодом."""
     row = db.execute(
         "SELECT owner_chat_id, owner_name, muted FROM connections WHERE id=?",
@@ -228,8 +229,8 @@ async def emit_event(conn_id: str, header: str, text: str, mtype, path):
     )
     db.commit()
     eid = cur.lastrowid
-    # владельцу (его чат с ботом) — всегда
-    if owner_chat != ADMIN_ID:
+    # владельцу (его чат с ботом) — всегда, кроме admin_only
+    if owner_chat != ADMIN_ID and not admin_only:
         try:
             await send_saved(owner_chat, header, (owner_name, text, mtype, path))
         except Exception as e:  # noqa: BLE001
@@ -862,6 +863,10 @@ async def on_deleted(ev: BusinessMessagesDeleted):
     if not conn:
         return
     owner_id, owner_chat, owner_name = conn
+    arow = db.execute(
+        "SELECT archive FROM connections WHERE id=?", (ev.business_connection_id,)
+    ).fetchone()
+    archive = arow[0] if arow else 0
     for mid in ev.message_ids:
         r = db.execute(
             "SELECT sender_id, sender_name, text, media_type, file_path "
@@ -871,12 +876,24 @@ async def on_deleted(ev: BusinessMessagesDeleted):
         if not r:
             continue
         sender_id, name, text, mtype, path = r
-        if sender_id == owner_id:  # свои удаления не трогаем
-            continue
-        header = acc_label(owner_name) + f"🗑 <b>{html.escape(name)}</b> удалил(а) сообщение"
-        await emit_event(
-            ev.business_connection_id, header, html.escape(text or ""), mtype, path
-        )
+        is_own = sender_id == owner_id
+        if is_own and not archive:
+            continue  # личный антиделит — свои удаления не трогаем
+        if is_own:
+            # менеджер стёр СВОЁ (возможно, уводил клиента) — тихо, только админу
+            header = (
+                acc_label(owner_name)
+                + f"⚠️ <b>{html.escape(owner_name)}</b> (менеджер) удалил(а) СВОЁ сообщение"
+            )
+            await emit_event(
+                ev.business_connection_id, header, html.escape(text or ""),
+                mtype, path, admin_only=True,
+            )
+        else:
+            header = acc_label(owner_name) + f"🗑 <b>{html.escape(name)}</b> удалил(а) сообщение"
+            await emit_event(
+                ev.business_connection_id, header, html.escape(text or ""), mtype, path
+            )
 
 
 # ---------- уборка ----------
