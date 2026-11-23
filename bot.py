@@ -35,8 +35,9 @@ from aiogram.types import (
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])  # куда слать ВСЁ от всех аккаунтов
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
-RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "365"))   # сколько храним текст переписок
-MEDIA_DAYS = int(os.getenv("MEDIA_DAYS", "45"))            # сколько храним сами файлы
+RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "365"))   # текст переписок для архивных аккаунтов
+MEDIA_DAYS = int(os.getenv("MEDIA_DAYS", "45"))            # сами файлы для архивных аккаунтов
+ANTIDELETE_DAYS = int(os.getenv("ANTIDELETE_DAYS", "3"))   # хранение для простых антиделит-аккаунтов
 MAX_DOWNLOAD = 20 * 1024 * 1024  # лимит Bot API на скачивание
 
 MEDIA_DIR = DATA_DIR / "media"
@@ -70,7 +71,8 @@ db.executescript(
         owner_id INTEGER NOT NULL,
         owner_chat_id INTEGER NOT NULL,
         owner_name TEXT NOT NULL DEFAULT '',
-        muted INTEGER NOT NULL DEFAULT 0
+        muted INTEGER NOT NULL DEFAULT 0,
+        archive INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS messages(
         conn_id TEXT, chat_id INTEGER, msg_id INTEGER,
@@ -90,6 +92,8 @@ db.executescript(
 cols = [r[1] for r in db.execute("PRAGMA table_info(connections)").fetchall()]
 if "muted" not in cols:
     db.execute("ALTER TABLE connections ADD COLUMN muted INTEGER NOT NULL DEFAULT 0")
+if "archive" not in cols:
+    db.execute("ALTER TABLE connections ADD COLUMN archive INTEGER NOT NULL DEFAULT 0")
 db.commit()
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -139,9 +143,12 @@ async def save_message(m: Message, owner_id: int | None = None):
     conn_id = m.business_connection_id
     if not conn_id:
         return
+    arow = db.execute("SELECT archive FROM connections WHERE id=?", (conn_id,)).fetchone()
+    archive = arow[0] if arow else 0
     mtype, file_id, ext, size = extract_media(m)
     path = None
-    if file_id and size <= MAX_DOWNLOAD:
+    # медиа качаем только для архивных аккаунтов (менеджеры), для простого антиделита — нет
+    if archive and file_id and size <= MAX_DOWNLOAD:
         dest = MEDIA_DIR / f"{m.chat.id}_{m.message_id}{ext}"
         try:
             await bot.download(file_id, destination=dest)
@@ -286,25 +293,28 @@ async def demo(c: CallbackQuery):
 
 def accounts_kb() -> InlineKeyboardMarkup:
     rows = db.execute(
-        "SELECT rowid, id, owner_name, muted FROM connections ORDER BY rowid"
+        "SELECT rowid, id, owner_name, muted, archive FROM connections ORDER BY rowid"
     ).fetchall()
     kb = []
-    for rid, conn_id, name, muted in rows:
+    for rid, conn_id, name, muted, archive in rows:
         unseen = db.execute(
             "SELECT COUNT(*) FROM events WHERE conn_id=? AND seen=0", (conn_id,)
         ).fetchone()[0]
         mark = "🔕" if muted else "🔔"
-        kb.append([InlineKeyboardButton(text=f"{mark} {name[:28]}", callback_data="noop")])
+        tag = "🗄" if archive else "🛡"  # 🗄 полный архив, 🛡 только антиделит
+        kb.append([InlineKeyboardButton(text=f"{mark}{tag} {name[:26]}", callback_data="noop")])
         kb.append([
             InlineKeyboardButton(
                 text=("🔔 Включить" if muted else "🔕 Заглушить"),
                 callback_data=f"mute:{rid}",
             ),
             InlineKeyboardButton(
-                text=f"📂 Показать ({unseen})", callback_data=f"show:{rid}"
+                text=("🛡 Антиделит" if archive else "🗄 Архив всего"),
+                callback_data=f"arch:{rid}",
             ),
         ])
         kb.append([
+            InlineKeyboardButton(text=f"📂 Показать ({unseen})", callback_data=f"show:{rid}"),
             InlineKeyboardButton(text="💬 Переписки", callback_data=f"chats:{rid}"),
             InlineKeyboardButton(text="🔎 Поиск", callback_data=f"search:{rid}"),
         ])
@@ -343,6 +353,25 @@ async def toggle_mute(c: CallbackQuery):
     except Exception:  # noqa: BLE001
         pass
     await c.answer("Заглушён" if muted and muted[0] else "Уведомления включены")
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("arch:"))
+async def toggle_archive(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        await c.answer()
+        return
+    rid = int(c.data.split(":", 1)[1])
+    db.execute("UPDATE connections SET archive=1-archive WHERE rowid=?", (rid,))
+    db.commit()
+    a = db.execute("SELECT archive FROM connections WHERE rowid=?", (rid,)).fetchone()
+    try:
+        await c.message.edit_reply_markup(reply_markup=accounts_kb())
+    except Exception:  # noqa: BLE001
+        pass
+    if a and a[0]:
+        await c.answer("🗄 Полный архив включён: качаю все медиа и храню переписки")
+    else:
+        await c.answer("🛡 Только антиделит: медиа не копится")
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("show:"))
@@ -754,7 +783,14 @@ async def cleanup_loop():
             (media_cutoff,),
         )
 
-        # 2) сам текст переписок держим RETENTION_DAYS, потом удаляем строки
+        # 2) текст: антиделит-аккаунты держим коротко, архивные — долго
+        anti_cutoff = now - ANTIDELETE_DAYS * 86400
+        db.execute(
+            "DELETE FROM messages WHERE ts<? AND conn_id IN "
+            "(SELECT id FROM connections WHERE archive=0)",
+            (anti_cutoff,),
+        )
+        # архивные и осиротевшие (отключённые) — по общему длинному сроку
         db.execute("DELETE FROM messages WHERE ts<?", (text_cutoff,))
         db.execute("DELETE FROM events WHERE seen=1 AND ts<?", (text_cutoff,))
         db.commit()
