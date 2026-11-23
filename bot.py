@@ -143,12 +143,11 @@ async def save_message(m: Message, owner_id: int | None = None):
     conn_id = m.business_connection_id
     if not conn_id:
         return
-    arow = db.execute("SELECT archive FROM connections WHERE id=?", (conn_id,)).fetchone()
-    archive = arow[0] if arow else 0
     mtype, file_id, ext, size = extract_media(m)
     path = None
-    # медиа качаем только для архивных аккаунтов (менеджеры), для простого антиделита — нет
-    if archive and file_id and size <= MAX_DOWNLOAD:
+    # медиа качаем всегда (нужно и для восстановления удалённого фото);
+    # разница режимов — только в сроке хранения (см. cleanup_loop)
+    if file_id and size <= MAX_DOWNLOAD:
         dest = MEDIA_DIR / f"{m.chat.id}_{m.message_id}{ext}"
         try:
             await bot.download(file_id, destination=dest)
@@ -754,18 +753,44 @@ async def on_deleted(ev: BusinessMessagesDeleted):
 
 
 # ---------- уборка ----------
+def unref_unlink(fp):
+    """Удаляем файл с диска, только если на него не ссылается ни messages, ни events."""
+    if not fp:
+        return
+    if db.execute("SELECT 1 FROM messages WHERE file_path=? LIMIT 1", (fp,)).fetchone():
+        return
+    if db.execute("SELECT 1 FROM events WHERE file_path=? LIMIT 1", (fp,)).fetchone():
+        return
+    Path(fp).unlink(missing_ok=True)
+
+
 async def cleanup_loop():
     while True:
         now = int(time.time())
         text_cutoff = now - RETENTION_DAYS * 86400
         media_cutoff = now - MEDIA_DAYS * 86400
+        anti_cutoff = now - ANTIDELETE_DAYS * 86400
+        candidates = set()
 
-        # 1) медиа-файлы старше MEDIA_DAYS удаляем, но текст сообщений оставляем
+        # A) антиделит-аккаунты: сносим старые сообщения целиком (и их файлы)
+        for fp, in db.execute(
+            "SELECT DISTINCT file_path FROM messages WHERE file_path IS NOT NULL AND ts<? "
+            "AND conn_id IN (SELECT id FROM connections WHERE archive=0)",
+            (anti_cutoff,),
+        ).fetchall():
+            candidates.add(fp)
+        db.execute(
+            "DELETE FROM messages WHERE ts<? AND conn_id IN "
+            "(SELECT id FROM connections WHERE archive=0)",
+            (anti_cutoff,),
+        )
+
+        # B) архивные: сами файлы старше MEDIA_DAYS убираем, текст оставляем
         for fp, in db.execute(
             "SELECT DISTINCT file_path FROM messages WHERE file_path IS NOT NULL AND ts<?",
             (media_cutoff,),
         ).fetchall():
-            Path(fp).unlink(missing_ok=True)
+            candidates.add(fp)
         db.execute(
             "UPDATE messages SET file_path=NULL WHERE file_path IS NOT NULL AND ts<?",
             (media_cutoff,),
@@ -774,26 +799,25 @@ async def cleanup_loop():
             "SELECT DISTINCT file_path FROM events WHERE file_path IS NOT NULL AND ts<?",
             (media_cutoff,),
         ).fetchall():
-            if not db.execute(
-                "SELECT 1 FROM messages WHERE file_path=? LIMIT 1", (fp,)
-            ).fetchone():
-                Path(fp).unlink(missing_ok=True)
+            candidates.add(fp)
         db.execute(
             "UPDATE events SET file_path=NULL WHERE file_path IS NOT NULL AND ts<?",
             (media_cutoff,),
         )
 
-        # 2) текст: антиделит-аккаунты держим коротко, архивные — долго
-        anti_cutoff = now - ANTIDELETE_DAYS * 86400
-        db.execute(
-            "DELETE FROM messages WHERE ts<? AND conn_id IN "
-            "(SELECT id FROM connections WHERE archive=0)",
-            (anti_cutoff,),
-        )
-        # архивные и осиротевшие (отключённые) — по общему длинному сроку
+        # C) текст архивных и осиротевших — по длинному сроку
+        for fp, in db.execute(
+            "SELECT DISTINCT file_path FROM messages WHERE file_path IS NOT NULL AND ts<?",
+            (text_cutoff,),
+        ).fetchall():
+            candidates.add(fp)
         db.execute("DELETE FROM messages WHERE ts<?", (text_cutoff,))
         db.execute("DELETE FROM events WHERE seen=1 AND ts<?", (text_cutoff,))
         db.commit()
+
+        # удаляем с диска всё, на что больше никто не ссылается
+        for fp in candidates:
+            unref_unlink(fp)
         await asyncio.sleep(6 * 3600)
 
 
