@@ -316,6 +316,9 @@ def accounts_kb() -> InlineKeyboardMarkup:
         kb.append([
             InlineKeyboardButton(text=f"📂 Показать ({unseen})", callback_data=f"show:{rid}"),
             InlineKeyboardButton(text="💬 Переписки", callback_data=f"chats:{rid}"),
+        ])
+        kb.append([
+            InlineKeyboardButton(text="🖼 Все медиа", callback_data=f"media:{rid}"),
             InlineKeyboardButton(text="🔎 Поиск", callback_data=f"search:{rid}"),
         ])
     if not kb:
@@ -610,6 +613,42 @@ async def show_chat(c: CallbackQuery):
     await bot.send_message(
         ADMIN_ID, "— конец переписки —", reply_markup=period_kb(rid, chat_id, days)
     )
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("media:"))
+async def show_media(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        await c.answer()
+        return
+    rid = int(c.data.split(":", 1)[1])
+    crow = db.execute(
+        "SELECT id, owner_id, owner_name FROM connections WHERE rowid=?", (rid,)
+    ).fetchone()
+    if not crow:
+        await c.answer("Нет аккаунта")
+        return
+    conn_id, owner_id, owner_name = crow
+    rows = db.execute(
+        "SELECT sender_id, sender_name, media_type, file_path, ts FROM messages "
+        "WHERE conn_id=? AND file_path IS NOT NULL ORDER BY ts DESC LIMIT 50",
+        (conn_id,),
+    ).fetchall()
+    rows = [r for r in rows if r[3] and Path(r[3]).exists()]
+    if not rows:
+        await c.answer("Медиа пока нет")
+        return
+    await c.answer(f"Показываю {len(rows)}…")
+    await bot.send_message(
+        ADMIN_ID, f"🖼 Медиа аккаунта <b>{html.escape(owner_name)}</b> (последние {len(rows)}):"
+    )
+    for sid, name, mtype, path, ts in rows:
+        t = datetime.fromtimestamp(ts, TZ).strftime("%d.%m %H:%M")
+        who = "Я" if sid == owner_id else html.escape((name or "?").split(" (")[0])
+        header = f"<b>{who}</b> <i>{t}</i>"
+        try:
+            await send_saved(ADMIN_ID, header, (who, "", mtype, path))
+        except Exception as e:  # noqa: BLE001
+            log.warning("media send fail: %s", e)
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("expacc:"))
