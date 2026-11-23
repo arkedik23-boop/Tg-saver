@@ -35,8 +35,8 @@ from aiogram.types import (
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])  # куда слать ВСЁ от всех аккаунтов
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
-RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "365"))   # текст переписок для архивных аккаунтов
-MEDIA_DAYS = int(os.getenv("MEDIA_DAYS", "45"))            # сами файлы для архивных аккаунтов
+RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "30"))    # текст переписок для архивных аккаунтов
+MEDIA_DAYS = int(os.getenv("MEDIA_DAYS", "30"))            # сами файлы для архивных аккаунтов
 ANTIDELETE_DAYS = int(os.getenv("ANTIDELETE_DAYS", "3"))   # хранение для простых антиделит-аккаунтов
 MAX_DOWNLOAD = 20 * 1024 * 1024  # лимит Bot API на скачивание
 
