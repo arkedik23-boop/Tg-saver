@@ -474,7 +474,7 @@ async def show_chat(c: CallbackQuery):
     conn_id, owner_id, owner_name = crow
     since = int(time.time()) - days * 86400
     msgs = db.execute(
-        "SELECT sender_id, sender_name, text, media_type, ts FROM messages "
+        "SELECT sender_id, sender_name, text, media_type, file_path, ts FROM messages "
         "WHERE conn_id=? AND chat_id=? AND ts>=? ORDER BY ts LIMIT 400",
         (conn_id, chat_id, since),
     ).fetchall()
@@ -490,21 +490,37 @@ async def show_chat(c: CallbackQuery):
         f"💬 <b>{html.escape(owner_name)}</b> ↔ <b>{html.escape(peer)}</b> "
         f"(за {days} дн., {len(msgs)} сообщ.)",
     )
-    lines, buf = [], ""
-    for sid, name, text, mtype, ts in msgs:
+    buf = ""
+
+    async def flush():
+        nonlocal buf
+        if buf.strip():
+            await bot.send_message(ADMIN_ID, buf)
+        buf = ""
+
+    for sid, name, text, mtype, path, ts in msgs:
         t = datetime.fromtimestamp(ts, TZ).strftime("%d.%m %H:%M")
         who = "Я" if sid == owner_id else html.escape((name or "?").split(" (")[0])
-        content = html.escape(text or "") or MEDIA_LABEL.get(mtype, "")
-        line = f"<b>{who}</b> <i>{t}</i>: {content}"
-        if len(buf) + len(line) > 3500:
-            lines.append(buf)
-            buf = ""
-        buf += line + "\n"
-    if buf:
-        lines.append(buf)
-    for i, chunk in enumerate(lines):
-        kb = period_kb(rid, chat_id, days) if i == len(lines) - 1 else None
-        await bot.send_message(ADMIN_ID, chunk, reply_markup=kb)
+        cap_text = html.escape(text or "")
+        if mtype and path and Path(path).exists():
+            # есть сам файл — отправляем его в ленту
+            await flush()
+            header = f"<b>{who}</b> <i>{t}</i>"
+            try:
+                await send_saved(ADMIN_ID, header, (who, cap_text, mtype, path))
+            except Exception as e:  # noqa: BLE001
+                log.warning("chat media send fail: %s", e)
+                buf += f"{header}: {cap_text or MEDIA_LABEL.get(mtype, '')}\n"
+        else:
+            content = cap_text or MEDIA_LABEL.get(mtype, "")
+            line = f"<b>{who}</b> <i>{t}</i>: {content}"
+            if len(buf) + len(line) > 3500:
+                await flush()
+            buf += line + "\n"
+    await flush()
+    await bot.send_message(
+        ADMIN_ID, "— конец переписки —", reply_markup=period_kb(rid, chat_id, days)
+    )
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("exp:"))
