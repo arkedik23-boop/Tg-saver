@@ -35,7 +35,8 @@ from aiogram.types import (
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])  # куда слать ВСЁ от всех аккаунтов
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
-RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "14"))
+RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "365"))   # сколько храним текст переписок
+MEDIA_DAYS = int(os.getenv("MEDIA_DAYS", "45"))            # сколько храним сами файлы
 MAX_DOWNLOAD = 20 * 1024 * 1024  # лимит Bot API на скачивание
 
 MEDIA_DIR = DATA_DIR / "media"
@@ -723,33 +724,39 @@ async def on_deleted(ev: BusinessMessagesDeleted):
         )
 
 
-# ---------- уборка старых файлов ----------
+# ---------- уборка ----------
 async def cleanup_loop():
     while True:
-        cutoff = int(time.time()) - RETENTION_DAYS * 86400
-        rows = db.execute(
-            "SELECT conn_id, chat_id, msg_id, file_path FROM messages WHERE ts<?",
-            (cutoff,),
-        ).fetchall()
-        for conn_id, chat_id, msg_id, fp in rows:
-            if fp and not db.execute(
-                "SELECT 1 FROM events WHERE file_path=? LIMIT 1", (fp,)
-            ).fetchone():
-                Path(fp).unlink(missing_ok=True)
-            db.execute(
-                "DELETE FROM messages WHERE conn_id=? AND chat_id=? AND msg_id=?",
-                (conn_id, chat_id, msg_id),
-            )
-        # прочитанные события старше срока
-        erows = db.execute(
-            "SELECT id, file_path FROM events WHERE seen=1 AND ts<?", (cutoff,)
-        ).fetchall()
-        for eid, fp in erows:
-            if fp and not db.execute(
+        now = int(time.time())
+        text_cutoff = now - RETENTION_DAYS * 86400
+        media_cutoff = now - MEDIA_DAYS * 86400
+
+        # 1) медиа-файлы старше MEDIA_DAYS удаляем, но текст сообщений оставляем
+        for fp, in db.execute(
+            "SELECT DISTINCT file_path FROM messages WHERE file_path IS NOT NULL AND ts<?",
+            (media_cutoff,),
+        ).fetchall():
+            Path(fp).unlink(missing_ok=True)
+        db.execute(
+            "UPDATE messages SET file_path=NULL WHERE file_path IS NOT NULL AND ts<?",
+            (media_cutoff,),
+        )
+        for fp, in db.execute(
+            "SELECT DISTINCT file_path FROM events WHERE file_path IS NOT NULL AND ts<?",
+            (media_cutoff,),
+        ).fetchall():
+            if not db.execute(
                 "SELECT 1 FROM messages WHERE file_path=? LIMIT 1", (fp,)
             ).fetchone():
                 Path(fp).unlink(missing_ok=True)
-            db.execute("DELETE FROM events WHERE id=?", (eid,))
+        db.execute(
+            "UPDATE events SET file_path=NULL WHERE file_path IS NOT NULL AND ts<?",
+            (media_cutoff,),
+        )
+
+        # 2) сам текст переписок держим RETENTION_DAYS, потом удаляем строки
+        db.execute("DELETE FROM messages WHERE ts<?", (text_cutoff,))
+        db.execute("DELETE FROM events WHERE seen=1 AND ts<?", (text_cutoff,))
         db.commit()
         await asyncio.sleep(6 * 3600)
 
