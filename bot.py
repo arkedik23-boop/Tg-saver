@@ -7,6 +7,7 @@ Telegram-бот: сохраняет сообщения собеседников 
 """
 import asyncio
 import html
+import json
 import logging
 import os
 import sqlite3
@@ -319,7 +320,63 @@ def accounts_kb() -> InlineKeyboardMarkup:
         ])
     if not kb:
         kb = [[InlineKeyboardButton(text="Пока никого не подключено", callback_data="noop")]]
+    if db.execute("SELECT 1 FROM connections WHERE archive=1 LIMIT 1").fetchone():
+        kb.append([InlineKeyboardButton(
+            text="📦 Выгрузить все архивы (JSON)", callback_data="expall"
+        )])
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def build_account_json(conn_id: str, owner_id: int, owner_name: str) -> dict:
+    """Все переписки аккаунта в структуре под обучение модели."""
+    rows = db.execute(
+        "SELECT chat_id, sender_id, sender_name, text, media_type, file_path, ts "
+        "FROM messages WHERE conn_id=? ORDER BY chat_id, ts",
+        (conn_id,),
+    ).fetchall()
+    chats: dict[int, dict] = {}
+    for chat_id, sid, name, text, mtype, path, ts in rows:
+        ch = chats.setdefault(chat_id, {"chat_id": chat_id, "peer": None, "messages": []})
+        role = "manager" if sid == owner_id else "guest"
+        if role == "guest" and not ch["peer"]:
+            ch["peer"] = name
+        ch["messages"].append({
+            "ts": datetime.fromtimestamp(ts, TZ).isoformat(),
+            "from": role,
+            "sender": name,
+            "text": text or "",
+            "media": mtype,
+            "file": Path(path).name if path else None,
+        })
+    return {
+        "account": owner_name,
+        "exported_at": datetime.now(TZ).isoformat(),
+        "chats": list(chats.values()),
+    }
+
+
+async def send_account_export(rid: int) -> bool:
+    crow = db.execute(
+        "SELECT id, owner_id, owner_name FROM connections WHERE rowid=?", (rid,)
+    ).fetchone()
+    if not crow:
+        return False
+    conn_id, owner_id, owner_name = crow
+    data = build_account_json(conn_id, owner_id, owner_name)
+    total = sum(len(ch["messages"]) for ch in data["chats"])
+    if not total:
+        return False
+    exp_dir = DATA_DIR / "exports"
+    exp_dir.mkdir(exist_ok=True)
+    safe = "".join(ch for ch in owner_name if ch.isalnum() or ch in " _-")[:30].strip() or "acc"
+    stamp = datetime.now(TZ).strftime("%Y%m%d")
+    fpath = exp_dir / f"{safe}_{stamp}.json"
+    fpath.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    await bot.send_document(
+        ADMIN_ID, FSInputFile(fpath),
+        caption=f"📦 {html.escape(owner_name)}: {len(data['chats'])} чатов, {total} сообщ.",
+    )
+    return True
 
 
 @dp.message(lambda m: m.text == "📂 Аккаунты")
@@ -438,8 +495,11 @@ def chats_kb(rid: int) -> InlineKeyboardMarkup:
             kb.append([InlineKeyboardButton(
                 text=f"💬 {title} ({cnt})", callback_data=f"chat:{rid}:{chat_id}:7"
             )])
+    kb.append([InlineKeyboardButton(
+        text="📦 Выгрузить весь аккаунт (JSON)", callback_data=f"expacc:{rid}"
+    )])
     kb.append([InlineKeyboardButton(text="« Назад", callback_data="back")])
-    if len(kb) == 1:
+    if len(kb) == 2:
         kb.insert(0, [InlineKeyboardButton(text="Переписок пока нет", callback_data="noop")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -550,6 +610,34 @@ async def show_chat(c: CallbackQuery):
     await bot.send_message(
         ADMIN_ID, "— конец переписки —", reply_markup=period_kb(rid, chat_id, days)
     )
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("expacc:"))
+async def export_account(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        await c.answer()
+        return
+    rid = int(c.data.split(":", 1)[1])
+    await c.answer("Готовлю JSON…")
+    ok = await send_account_export(rid)
+    if not ok:
+        await bot.send_message(ADMIN_ID, "По этому аккаунту пока нечего выгружать.")
+
+
+@dp.callback_query(lambda c: c.data == "expall")
+async def export_all(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        await c.answer()
+        return
+    await c.answer("Выгружаю все архивные…")
+    rids = [r[0] for r in db.execute(
+        "SELECT rowid FROM connections WHERE archive=1 ORDER BY rowid"
+    ).fetchall()]
+    n = 0
+    for rid in rids:
+        if await send_account_export(rid):
+            n += 1
+    await bot.send_message(ADMIN_ID, f"Готово: выгружено аккаунтов — {n}.")
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("exp:"))
