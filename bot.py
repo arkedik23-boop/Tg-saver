@@ -806,6 +806,14 @@ async def capture_reply_media(m: Message):
     mtype, file_id, ext, size = extract_media(r)
     if not file_id or mtype not in ("photo", "video", "video_note", "animation"):
         return
+    # обычное фото/видео бот уже получил и сохранил при отправке — значит это НЕ исчезающее,
+    # а просто ответ на обычное сообщение. Реагируем только на то, чего в базе нет.
+    already = db.execute(
+        "SELECT 1 FROM messages WHERE conn_id=? AND chat_id=? AND msg_id=? LIMIT 1",
+        (m.business_connection_id, m.chat.id, r.message_id),
+    ).fetchone()
+    if already:
+        return
     conn = get_conn(m.business_connection_id)
     if not conn:
         return
