@@ -10,6 +10,7 @@ import html
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -39,6 +40,7 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "30"))    # текст переписок для архивных аккаунтов
 MEDIA_DAYS = int(os.getenv("MEDIA_DAYS", "30"))            # сами файлы для архивных аккаунтов
 ANTIDELETE_DAYS = int(os.getenv("ANTIDELETE_DAYS", "3"))   # хранение для простых антиделит-аккаунтов
+DISK_ALERT_PCT = int(os.getenv("DISK_ALERT_PCT", "80"))    # % диска, при котором предупреждать админа
 MAX_DOWNLOAD = 20 * 1024 * 1024  # лимит Bot API на скачивание
 
 MEDIA_DIR = DATA_DIR / "media"
@@ -970,7 +972,35 @@ async def cleanup_loop():
         # удаляем с диска всё, на что больше никто не ссылается
         for fp in candidates:
             unref_unlink(fp)
+
+        await check_disk()
         await asyncio.sleep(6 * 3600)
+
+
+_last_disk_alert = 0.0
+
+
+async def check_disk():
+    """Если диск заполнен выше порога — раз в сутки предупреждаем админа."""
+    global _last_disk_alert
+    try:
+        usage = shutil.disk_usage(DATA_DIR)
+    except Exception:  # noqa: BLE001
+        return
+    pct = usage.used / usage.total * 100
+    if pct >= DISK_ALERT_PCT and time.time() - _last_disk_alert > 86400:
+        _last_disk_alert = time.time()
+        free_gb = usage.free / 1024 ** 3
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"⚠️ <b>Диск сервера заполнен на {pct:.0f}%</b>\n"
+                f"Свободно: {free_gb:.1f} ГБ.\n"
+                "Архив медиа растёт. Можно уменьшить срок хранения файлов "
+                "(MEDIA_DAYS) или расширить диск на Timeweb.",
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("disk alert fail: %s", e)
 
 
 async def main():
